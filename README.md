@@ -9,7 +9,8 @@ ambient light sensor, and turns NumLock on at start:
   have to switch NumLock off first). With this service, changing one changes
   the others.
 - **Ambient light.** The backlight level follows the laptop's ambient light
-  sensor: low in a dark room, brighter in dim light, off in bright light.
+  sensor: full level in a dark room, lower as the room gets lighter, off in
+  bright light.
 - **NumLock on at start.** NumLock is turned on at boot and at login, so the
   numpad types numbers right away.
 - **NumLock indicator** (optional, off by default). The numpad has no NumLock
@@ -143,18 +144,19 @@ uinput rule, the power-button LED rule), so use `./fkt.sh set numlock=yes` or
 `below-this-many-lux:level` entries ending with `*:level`:
 
 ```bash
-./fkt.sh set bands="8:85 60:170 250:255 *:0"     # the default
+./fkt.sh set bands="20:255 250:170 *:0"     # the default
 ```
 
 | Ambient light | Backlight |
 |---|---|
-| below 8 lux (dark room) | 85 (33 %) |
-| 8 to 60 lux (dim) | 170 (67 %) |
-| 60 to 250 lux (indoor light) | 255 (100 %) |
+| below 20 lux (dark room) | 255 (100 %) |
+| 20 to 250 lux (dim to indoor light) | 170 (67 %) |
 | 250 lux and more (bright) | off |
 
-For example `./fkt.sh set bands="8:85 60:170 *:255"` keeps the backlight on
-in bright light. A line the service cannot read is reported in the journal and the
+The lowest step, 85 (33 %), is not in the default table: in indoor light it
+is too faint to see. For example `./fkt.sh set bands="20:255 *:170"` keeps
+the backlight on in bright light, and `./fkt.sh set bands="250:255 *:0"` uses
+only full level and off. A line the service cannot read is reported in the journal and the
 default is used instead.
 
 ### Timing

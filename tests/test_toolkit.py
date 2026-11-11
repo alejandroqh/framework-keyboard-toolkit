@@ -227,11 +227,11 @@ class ToolkitTests(unittest.TestCase):
 
     def test_without_sync_numpad_is_not_even_opened(self):
         self.tk.SYNC = False
-        kbd, pad = self.keyboard_and_numpad(kbd=255, pad=85)
+        kbd, pad = self.keyboard_and_numpad(kbd=170, pad=85)
         self.light(3)
         self.ticks(30)
         self.assertEqual(list(self.kit.modules), ["hidraw7"])
-        self.assertEqual(kbd.actual, 85)            # ambient still drives the keyboard
+        self.assertEqual(kbd.actual, 255)           # ambient still drives the keyboard
         self.assertEqual((pad.actual, pad.sets), (85, []))
 
     def test_without_sync_keyboard_key_still_overrides_light(self):
@@ -262,14 +262,13 @@ class ToolkitTests(unittest.TestCase):
     # -- ambient light -------------------------------------------------------------
 
     def test_first_reading_sets_both_modules(self):
-        kbd, pad = self.keyboard_and_numpad()
+        kbd, pad = self.keyboard_and_numpad(kbd=85, pad=85)
         self.light(3)
         self.tick()
-        self.assertEqual((kbd.actual, pad.actual), (85, 85))
+        self.assertEqual((kbd.actual, pad.actual), (255, 255))
 
     def test_each_band_maps_to_its_level(self):
-        for lux, level in ((0, 85), (7, 85), (8, 170), (59, 170), (60, 255), (249, 255),
-                           (250, 0), (40000, 0)):
+        for lux, level in ((0, 255), (19, 255), (20, 170), (249, 170), (250, 0), (40000, 0)):
             self.assertEqual(self.tk.BANDS[self.tk.band_of(lux)][1], level, lux)
 
     def test_band_change_needs_two_readings(self):
@@ -294,14 +293,14 @@ class ToolkitTests(unittest.TestCase):
         self.assertEqual(kbd.sets, [0])
 
     def test_light_hovering_at_a_limit_does_not_flap(self):
-        kbd, _ = self.keyboard_and_numpad()
+        kbd, _ = self.keyboard_and_numpad(kbd=170, pad=170)
         self.light(240)
         self.tick()
         for lux in (255, 245, 270, 240, 290, 230) * 3:    # limit 250, +-20 %
             self.light(lux)
             self.ticks(self.tk.LUX_EVERY_S)
         self.assertEqual(kbd.sets, [])
-        self.assertEqual(kbd.actual, 255)
+        self.assertEqual(kbd.actual, 170)
 
     def test_manual_level_holds_until_band_changes(self):
         kbd, pad = self.keyboard_and_numpad()

@@ -45,7 +45,7 @@ Settings:
   numlock=yes|no   turn NumLock on at boot and login
   indicator=yes|no show NumLock changes on the power-button LED (default no):
                    two short blinks = on, one long blink = off
-  bands="8:85 60:170 250:255 *:0"
+  bands="20:255 250:170 *:0"
                    backlight level (0-255) below each lux limit, "*" = brighter
 
 Examples:

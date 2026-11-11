@@ -39,9 +39,8 @@ INDICATOR = False          # show NumLock changes on the power-button LED
 # (below this many lux, backlight level 0-255); the last entry has no limit.
 # The white keyboards and the numpad only have four steps: 0, 85, 170, 255.
 BANDS = (
-    (8, 85),       # dark room: a low level is enough
-    (60, 170),     # dim
-    (250, 255),    # indoor light: needs full level to be visible
+    (20, 255),     # dark room: full level
+    (250, 170),    # dim to indoor light (85 is too faint to see there)
     (None, 0),     # bright: off
 )
 
