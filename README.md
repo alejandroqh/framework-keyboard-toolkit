@@ -48,6 +48,7 @@ Measured on the reference system: 0.02 s of CPU time per minute when idle
 ## Install
 
 ```bash
+git clone https://github.com/alejandroqh/framework-keyboard-toolkit.git
 cd framework-keyboard-toolkit
 ./fkt.sh install
 ```
