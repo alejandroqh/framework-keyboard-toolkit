@@ -1,0 +1,8 @@
+# Let group fprint-led write the trigger and brightness of the Framework
+# power-button LED, so framework-keyboard-toolkit can blink it on a NumLock
+# change. Installed only while "indicator = yes" is set in
+# /etc/framework-keyboard-toolkit.conf. The group is the one
+# framework-fingerprint-led-blink uses for the same LED, so both can be installed.
+ACTION=="add|change", SUBSYSTEM=="leds", KERNEL=="chromeos:white:power", \
+  RUN+="/usr/bin/chgrp fprint-led /sys%p/trigger /sys%p/brightness", \
+  RUN+="/usr/bin/chmod g+w /sys%p/trigger /sys%p/brightness"

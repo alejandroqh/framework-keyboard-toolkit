@@ -12,8 +12,10 @@ Runs unprivileged, in one slow polling loop:
   desktop), NumLock is turned on if the numpad reports it off, by pressing
   the NumLock key once on a throwaway virtual keyboard. After that short
   window NumLock is left alone, so it can still be switched off by hand.
+* NumLock indicator (optional): the numpad has no NumLock light, so a change
+  is shown on the power-button LED: two short blinks for on, one long for off.
 
-Each of the three can be switched off in /etc/framework-keyboard-toolkit.conf.
+Each of them can be switched on or off in /etc/framework-keyboard-toolkit.conf.
 Nothing is written to the modules' EEPROM; levels set here are not saved.
 """
 import fcntl
@@ -32,6 +34,7 @@ CONFIG = "/etc/framework-keyboard-toolkit.conf"
 SYNC = True                # numpad / macropad and keyboard share one level
 AMBIENT = True             # the level follows the ambient light sensor
 NUMLOCK = True             # turn NumLock on at boot / login
+INDICATOR = False          # show NumLock changes on the power-button LED
 
 # (below this many lux, backlight level 0-255); the last entry has no limit.
 # The white keyboards and the numpad only have four steps: 0, 85, 170, 255.
@@ -52,6 +55,10 @@ FAST_FOR_S = 10            # how long to stay fast after a manual change
 LUX_EVERY_S = 5            # light sensor reading interval
 NUMLOCK_WINDOW_S = 30      # how long after start / new session NumLock is watched
 NUMLOCK_MAX_PRESSES = 3    # per window
+INDICATOR_POLL_S = 0.2     # how often the NumLock state is looked at for the indicator
+# Power-button LED patterns as (seconds dark, seconds lit) steps.
+BLINK_ON = ((0.15, 0.15), (0.15, 0.0))    # NumLock on: two short blinks
+BLINK_OFF = ((0.8, 0.0),)                 # NumLock off: one long one
 # -----------------------------------------------------------------------------
 
 VENDOR = "32AC"
@@ -71,6 +78,8 @@ ALS_GLOB = "/sys/bus/iio/devices/iio:device*/in_illuminance_raw"
 LED_GLOB = "/sys/class/leds/input*::numlock"
 SESSIONS_DIR = "/run/systemd/sessions"
 UINPUT = "/dev/uinput"
+POWER_LED = "/sys/class/leds/chromeos:white:power"
+LED_IDLE = "[chromeos-auto]"   # trigger while the embedded controller owns the LED
 
 # VIA protocol (v3) over the raw-HID interface, usage page 0xFF60.
 VIA_USAGE = bytes([0x06, 0x60, 0xFF])
@@ -135,7 +144,7 @@ def load_config():
         if not key and not equals:
             continue
         try:
-            if key in ("sync", "ambient", "numlock") and equals:
+            if key in ("sync", "ambient", "numlock", "indicator") and equals:
                 if value.lower() not in YES_NO:
                     raise ValueError(f"'{value}' is not yes or no")
                 globals()[key.upper()] = YES_NO[value.lower()]
@@ -148,7 +157,8 @@ def load_config():
 
 
 def describe_config():
-    names = (("sync", SYNC), ("ambient light", AMBIENT), ("NumLock", NUMLOCK))
+    names = (("sync", SYNC), ("ambient light", AMBIENT), ("NumLock", NUMLOCK),
+             ("NumLock indicator", INDICATOR))
     return ", ".join(f"{name} {'on' if value else 'off'}" for name, value in names)
 
 
@@ -251,16 +261,50 @@ def band_of(lux):
     return len(BANDS) - 1
 
 
+_numpad_led = None    # sysfs directory of the numpad's NumLock LED, once found
+
+
 def numpad_numlock():
     """NumLock LED state of the numpad module (True / False), None without one."""
+    global _numpad_led
+    if _numpad_led:
+        try:
+            return read_text(f"{_numpad_led}/brightness") != "0"
+        except OSError:
+            _numpad_led = None               # numpad removed or re-enumerated
     for led in sorted(glob.glob(LED_GLOB)):
         try:
             if (read_text(f"{led}/device/id/vendor").upper() == VENDOR
                     and read_text(f"{led}/device/id/product") == NUMPAD_PID):
-                return read_text(f"{led}/brightness") != "0"
+                state = read_text(f"{led}/brightness") != "0"
+                _numpad_led = led
+                return state
         except OSError:
             continue
     return None
+
+
+def led_write(name, value):
+    with open(f"{POWER_LED}/{name}", "w") as f:
+        f.write(value)
+
+
+def show_numlock(on):
+    """Blink the power-button LED for a NumLock change, then give it back."""
+    try:
+        if LED_IDLE not in read_text(f"{POWER_LED}/trigger"):
+            return                           # something else is blinking it right now
+        led_write("trigger", "none")
+        try:
+            for dark, lit in BLINK_ON if on else BLINK_OFF:
+                led_write("brightness", "0")
+                time.sleep(dark)
+                led_write("brightness", "100")
+                time.sleep(lit)
+        finally:
+            led_write("trigger", "chromeos-auto")
+    except OSError as e:
+        log(f"power-button LED: {e}")
 
 
 def session_names():
@@ -318,6 +362,7 @@ class Toolkit:
         self.numlock_until = 0.0
         self.numlock_presses = 0
         self.numlock_off_seen = False
+        self.numlock_shown = None  # NumLock state last seen by the indicator
 
     # -- modules ---------------------------------------------------------------
 
@@ -440,6 +485,13 @@ class Toolkit:
             except OSError as e:
                 log(f"NumLock key press failed: {e}")
 
+    def indicate(self):
+        """Show a NumLock change on the power-button LED."""
+        state = numpad_numlock()
+        if None not in (state, self.numlock_shown) and state != self.numlock_shown:
+            show_numlock(state)
+        self.numlock_shown = state           # None (no numpad): start over when it is back
+
     # -- loop --------------------------------------------------------------------
 
     def tick(self):
@@ -463,6 +515,19 @@ class Toolkit:
             self.numlock(now)
         fast = now < self.fast_until or now < self.numlock_until
         return FAST_TICK_S if fast else TICK_S
+
+    def wait(self, seconds, sleep=time.sleep):
+        """Sleep until the next pass, watching NumLock for the indicator meanwhile."""
+        if not INDICATOR:
+            sleep(seconds)
+            return
+        end = self.clock() + seconds
+        while True:
+            self.indicate()
+            left = end - self.clock()
+            if left <= 0:
+                return
+            sleep(min(INDICATOR_POLL_S, left))
 
     def close(self):
         for name in list(self.modules):
@@ -491,6 +556,9 @@ def status():
     state = numpad_numlock()
     print("numlock:   " + {True: "on", False: "off", None: "no numpad attached"}[state])
     print(f"uinput:    {'writable' if os.access(UINPUT, os.W_OK) else 'not writable'}")
+    if INDICATOR:
+        usable = all(os.access(f"{POWER_LED}/{name}", os.W_OK) for name in ("trigger", "brightness"))
+        print(f"power led: {'writable' if usable else 'not writable (or missing)'}")
     print(f"sessions:  {sorted(n for n in session_names() if has_seat(n)) or 'none'} (local)")
 
 
@@ -510,7 +578,7 @@ def main():
     kit = Toolkit()
     try:
         while True:
-            time.sleep(kit.tick())
+            kit.wait(kit.tick())
     finally:
         kit.close()
 

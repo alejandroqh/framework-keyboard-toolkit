@@ -10,6 +10,16 @@ RULE_NUMLOCK=/etc/udev/rules.d/90-$NAME-numlock.rules
 SYSUSERS=/etc/sysusers.d/$NAME.conf
 CONF=/etc/$NAME.conf
 GROUP=fw-kbd-toolkit
+# NumLock indicator on the power-button LED (only with "indicator = yes").
+LED=/sys/class/leds/chromeos:white:power
+LED_FILES=(trigger brightness)
+LED_GROUP=fprint-led
+RULE_LED=/etc/udev/rules.d/90-$NAME-led.rules
+SYSUSERS_LED=/etc/sysusers.d/$NAME-led.conf
+DROPIN_DIR=/etc/systemd/system/$NAME.service.d
+DROPIN_LED=$DROPIN_DIR/indicator.conf
+# framework-fingerprint-led-blink shares that LED and group; leave them to it.
+FPRINT_RULE=/etc/udev/rules.d/90-framework-fingerprint-led-blink.rules
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
@@ -33,6 +43,8 @@ Settings:
   sync=yes|no      keyboard and numpad share one backlight level
   ambient=yes|no   the level follows the ambient light sensor
   numlock=yes|no   turn NumLock on at boot and login
+  indicator=yes|no show NumLock changes on the power-button LED (default no):
+                   two short blinks = on, one long blink = off
   bands="8:85 60:170 250:255 *:0"
                    backlight level (0-255) below each lux limit, "*" = brighter
 
@@ -64,23 +76,25 @@ parse_settings() {
         [[ $arg == *=* ]] || die "'$arg' is not SETTING=VALUE (see ./fkt.sh help)"
         key=${arg%%=*}; value=${arg#*=}
         case $key in
-            sync|ambient|numlock)
+            sync|ambient|numlock|indicator)
                 [[ $value == yes || $value == no ]] || die "$key: use yes or no" ;;
             bands)
                 valid_bands "$value" || die "bands: use \"LUX:LEVEL ... *:LEVEL\", for example \"8:85 60:170 *:255\"" ;;
-            *) die "unknown setting '$key' (sync, ambient, numlock, bands)" ;;
+            *) die "unknown setting '$key' (sync, ambient, numlock, indicator, bands)" ;;
         esac
         SET[$key]=$value
     done
 }
 
-# yes / no value of setting "$1" in $CONF (yes when it is not there).
+# yes / no value of setting "$1" in $CONF. When it is not there: yes, except
+# for the indicator, which is off unless asked for.
 conf_get() {
     local value
     value=$(sed -nE "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*([^#[:space:]]*).*/\1/p" "$CONF" | tail -n 1)
     case ${value,,} in
-        no|false|off|0) echo no ;;
-        *)              echo yes ;;
+        no|false|off|0)  echo no ;;
+        yes|true|on|1)   echo yes ;;
+        *)               [[ $1 == indicator ]] && echo no || echo yes ;;
     esac
 }
 
@@ -121,10 +135,11 @@ configure() {
         ask sync    "Keep keyboard and numpad backlight at the same level?"
         ask ambient "Let the backlight follow the ambient light sensor?"
         ask numlock "Turn NumLock on at boot and login (needs access to /dev/uinput)?"
+        ask indicator "Blink the power-button LED when NumLock changes (2 short = on, 1 long = off)?"
     fi
     chmod 0644 "$CONF"
     command -v restorecon >/dev/null && restorecon "$CONF" || true
-    info "Configuration ($CONF): sync $(conf_get sync), ambient light $(conf_get ambient), NumLock $(conf_get numlock)"
+    info "Configuration ($CONF): sync $(conf_get sync), ambient light $(conf_get ambient), NumLock $(conf_get numlock), NumLock indicator $(conf_get indicator)"
 }
 
 # --- device access ---------------------------------------------------------------
@@ -164,7 +179,25 @@ retrigger() {
     if [[ -e /dev/uinput ]]; then
         udevadm trigger --action=change /dev/uinput
     fi
+    if [[ -e $LED ]]; then
+        udevadm trigger --action=change "$LED"
+    fi
     udevadm settle
+}
+
+# Give the power-button LED back to root, unless the fingerprint service uses it.
+release_led() {
+    local f
+    rm -f "$RULE_LED" "$SYSUSERS_LED" "$DROPIN_LED"
+    rmdir "$DROPIN_DIR" 2>/dev/null || true
+    [[ -e $FPRINT_RULE ]] && return
+    for f in "${LED_FILES[@]}"; do
+        if [[ -e $LED/$f && $(stat -c %G "$LED/$f") == "$LED_GROUP" ]]; then
+            chown root:root "$LED/$f" || true
+            chmod 0644 "$LED/$f" || true
+        fi
+    done
+    groupdel "$LED_GROUP" 2>/dev/null || true
 }
 
 # Group, udev rules and node permissions for what $CONF switches on.
@@ -180,9 +213,31 @@ setup_access() {
     else
         rm -f "$RULE_NUMLOCK"
     fi
-    command -v restorecon >/dev/null && restorecon "$SYSUSERS" "$RULE" "$RULE_NUMLOCK" 2>/dev/null || true
+    if [[ $(conf_get indicator) == yes ]]; then
+        info "Granting group $LED_GROUP access to the power-button LED (for the NumLock indicator)"
+        install -D -m 0644 "$SRC_DIR/packaging/sysusers-led.conf" "$SYSUSERS_LED"
+        install -D -m 0644 "$SRC_DIR/packaging/90-$NAME-led.rules" "$RULE_LED"
+        install -D -m 0644 "$SRC_DIR/packaging/indicator.conf" "$DROPIN_LED"
+        systemd-sysusers "$SYSUSERS_LED"
+    else
+        release_led
+    fi
+    command -v restorecon >/dev/null \
+        && restorecon -R "$SYSUSERS" "$SYSUSERS_LED" "$RULE" "$RULE_NUMLOCK" "$RULE_LED" "$DROPIN_DIR" 2>/dev/null || true
     systemd-sysusers "$SYSUSERS"
     retrigger
+    if [[ $(conf_get indicator) == yes ]]; then
+        local f
+        if [[ ! -e $LED/trigger ]]; then
+            warn "no power-button LED ($LED): the NumLock indicator will do nothing."
+        else
+            for f in "${LED_FILES[@]}"; do
+                [[ $(stat -c %G "$LED/$f") == "$LED_GROUP" ]] \
+                    && (( ( 8#$(stat -c %a "$LED/$f") & 8#020 ) != 0 )) \
+                    || warn "udev rule did not apply to $LED/$f: the NumLock indicator will not blink."
+            done
+        fi
+    fi
     while read -r node; do
         [[ $(stat -c %G "$node") == "$GROUP" ]] \
             || die "udev rule did not apply to $node (expected group $GROUP)."
@@ -256,6 +311,7 @@ cmd_uninstall() {
     info "Stopping and disabling $NAME"
     systemctl disable --now "$NAME.service" 2>/dev/null || true
     rm -f "$BIN" "$UNIT" "$RULE" "$RULE_NUMLOCK" "$SYSUSERS" "$CONF"
+    release_led
     systemctl daemon-reload
     retrigger || true
     groupdel "$GROUP" 2>/dev/null || true

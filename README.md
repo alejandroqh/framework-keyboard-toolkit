@@ -12,8 +12,11 @@ ambient light sensor, and turns NumLock on at start:
   sensor: low in a dark room, brighter in dim light, off in bright light.
 - **NumLock on at start.** NumLock is turned on at boot and at login, so the
   numpad types numbers right away.
+- **NumLock indicator** (optional, off by default). The numpad has no NumLock
+  light, so a change is shown on the power-button LED: two short blinks when
+  NumLock turns on, one long blink when it turns off.
 
-Each of the three can be switched off on its own, see
+Each of them can be switched on or off on its own, see
 [Configuration](#configuration).
 
 ## How it works
@@ -36,6 +39,13 @@ One unprivileged, sandboxed process polls every 2 seconds:
   the LED is off, it presses NumLock once on a throwaway virtual keyboard
   that only has that one key. After those 30 seconds NumLock is left alone,
   so switching it off by hand sticks. Without a numpad nothing is pressed.
+- With the NumLock indicator on, it also reads the numpad's NumLock state
+  five times a second (one small sysfs read). On a change it takes over the
+  power-button LED for less than a second, blinks the pattern and hands the
+  LED back to the embedded controller. If something else is using the LED at
+  that moment (for example
+  [framework-fingerprint-led-blink](https://github.com/alejandroqh/framework-fingerprint-led-blink)),
+  the blink is skipped.
 
 Levels are set in the modules' memory only; nothing is written to their
 EEPROM and no firmware is changed. The white keyboards and the numpad have
@@ -53,7 +63,7 @@ cd framework-keyboard-toolkit
 ./fkt.sh install
 ```
 
-`fkt.sh` asks for sudo, asks which of the three features you want (first
+`fkt.sh` asks for sudo, asks which features you want (first
 install only), copies the files, creates the group `fw-kbd-toolkit`, loads
 the udev rules and starts the service. The only dependency is Python
 3.8 or newer (standard library only) and systemd.
@@ -83,9 +93,17 @@ Everything else goes through the same script:
 | `/etc/udev/rules.d/90-framework-keyboard-toolkit-numlock.rules` | gives that group access to `/dev/uinput`; only installed with `numlock = yes` |
 | `/etc/sysusers.d/framework-keyboard-toolkit.conf` | creates that group |
 
+Only with `indicator = yes`:
+
+| File | Purpose |
+|---|---|
+| `/etc/udev/rules.d/90-framework-keyboard-toolkit-led.rules` | gives group `fprint-led` write access to the power-button LED's `trigger` and `brightness` |
+| `/etc/sysusers.d/framework-keyboard-toolkit-led.conf` | creates that group if it is not there |
+| `/etc/systemd/system/framework-keyboard-toolkit.service.d/indicator.conf` | adds the service to that group and lets it write to `/sys` |
+
 ## Configuration
 
-Three switches, all on by default:
+Four switches; the first three are on by default, the indicator is off:
 
 ```bash
 ./fkt.sh configure                       # asks about each one
@@ -101,6 +119,7 @@ service. Settings you do not mention keep their value.
 | `sync` | keyboard, numpad and macropad share one level | only the keyboard is managed; the numpad keeps the level set with its own key |
 | `ambient` | the level follows the light sensor | the level only changes when you press a backlight key |
 | `numlock` | NumLock is turned on at boot and login | NumLock is never touched, and the service gets no access to `/dev/uinput` |
+| `indicator` | a NumLock change blinks the power-button LED (2 short = on, 1 long = off) | (default) the power-button LED is never touched |
 
 Some combinations:
 
@@ -110,11 +129,13 @@ Some combinations:
 | Light sensor, no numpad attached | nothing to change: without a numpad there is nothing to sync and NumLock is not pressed |
 | Light sensor on the keyboard, numpad left alone | `./fkt.sh set sync=no` |
 | Keep NumLock as the system sets it | `./fkt.sh set numlock=no` |
+| See whether NumLock is on or off | `./fkt.sh set indicator=yes` |
 
 You can also edit the file by hand and run
-`sudo systemctl restart framework-keyboard-toolkit`. The one exception is
-switching `numlock` back **on**: that needs the uinput udev rule, so use
-`./fkt.sh set numlock=yes`.
+`sudo systemctl restart framework-keyboard-toolkit`. The exceptions are
+switching `numlock` or `indicator` **on**: they need extra permissions (the
+uinput rule, the power-button LED rule), so use `./fkt.sh set numlock=yes` or
+`./fkt.sh set indicator=yes`.
 
 ### Light table
 
@@ -140,7 +161,8 @@ default is used instead.
 
 The poll intervals, the hysteresis and the NumLock window are constants at
 the top of `framework-keyboard-toolkit` (`TICK_S`, `FAST_TICK_S`,
-`LUX_EVERY_S`, `HYSTERESIS`, `DWELL`, `NUMLOCK_WINDOW_S`). Edit them and
+`LUX_EVERY_S`, `HYSTERESIS`, `DWELL`, `NUMLOCK_WINDOW_S`), and so are the
+indicator's blink patterns (`BLINK_ON`, `BLINK_OFF`). Edit them and
 run `./fkt.sh install` again.
 
 ## Security
@@ -154,6 +176,11 @@ run `./fkt.sh install` again.
     permission: a process with it can create virtual input devices. If you
     do not want that, install with `./fkt.sh install numlock=no`: the uinput rule is then
     not installed at all.
+  - With `indicator = yes` only: the `trigger` and `brightness` files of the
+    power-button LED, through group `fprint-led`. That is the group
+    framework-fingerprint-led-blink uses for the same LED, so both services
+    can be installed together. The service is then also allowed to write to
+    `/sys` (`ProtectKernelTunables=no`), where that LED lives.
 - **Sandboxed.** Read-only filesystem, no network and no sockets at all,
   only hidraw and uinput device nodes, syscall filter, `NoNewPrivileges`,
   `MemoryDenyWriteExecute` and more.
@@ -171,7 +198,8 @@ python3 -m unittest discover -s tests
 The tests run the real logic against fake modules and a fake sysfs: sync in
 both directions, hot-plug, modules with different step counts, the light
 table with hysteresis, manual override, the NumLock window, each switch
-turned off, and the configuration file parser.
+turned off, the NumLock indicator and its blink patterns, and the
+configuration file parser.
 
 ## Tested on
 
@@ -179,7 +207,8 @@ turned off, and the configuration file parser.
 |---|---|---|---|---|
 | Framework Laptop 16 (AMD Ryzen AI 300 Series) | ANSI keyboard, numpad | Fedora 45, KDE Plasma (Wayland) | `fkt.sh install` | maintainer (reference system below) |
 
-So far all three features work on that one setup, including after a reboot.
+So far all features, including the NumLock indicator, work on that one setup,
+also after a reboot.
 Not tested yet:
 
 - the ISO (`32AC:0018`) and JIS (`32AC:0019`) keyboards and the RGB macropad

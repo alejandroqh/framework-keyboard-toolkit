@@ -67,6 +67,8 @@ class ToolkitTests(unittest.TestCase):
             None if self.hardware[name].dead else self.hardware[name])
         self.presses = []
         self.tk.press_numlock = lambda: self.presses.append(self.now)
+        self.shown = []
+        self.tk.show_numlock = self.shown.append
 
         self.now = 100.0
         self.kit = self.tk.Toolkit(clock=lambda: self.now)
@@ -403,6 +405,116 @@ class ToolkitTests(unittest.TestCase):
         self.ticks(30)
         self.assertEqual(self.presses, [])
 
+    # -- NumLock indicator -----------------------------------------------------------
+
+    def test_indicator_stays_quiet_for_the_state_it_starts_with(self):
+        self.numpad_led(True)
+        self.kit.indicate()
+        self.kit.indicate()
+        self.assertEqual(self.shown, [])
+
+    def test_indicator_shows_each_change_once(self):
+        self.numpad_led(True)
+        self.kit.indicate()
+        self.numpad_led(False)
+        self.kit.indicate()
+        self.kit.indicate()
+        self.numpad_led(True)
+        self.kit.indicate()
+        self.assertEqual(self.shown, [False, True])
+
+    def test_indicator_ignores_numpad_coming_and_going(self):
+        self.kit.indicate()                 # no numpad yet
+        self.numpad_led(True)
+        self.kit.indicate()                 # plugged in: a first state, not a change
+        (self.leds / "input12::numlock" / "brightness").unlink()
+        self.kit.indicate()                 # unplugged
+        self.numpad_led(False)
+        self.kit.indicate()                 # back, in the other state
+        self.assertEqual(self.shown, [])
+
+    def test_wait_without_indicator_is_one_plain_sleep(self):
+        slept = []
+        self.numpad_led(True)
+        self.kit.wait(2.0, sleep=slept.append)
+        self.assertEqual(slept, [2.0])
+        self.assertIsNone(self.kit.numlock_shown)
+
+    def test_wait_with_indicator_looks_at_numlock_in_small_steps(self):
+        self.tk.INDICATOR = True
+        self.numpad_led(True)
+        slept = []
+
+        def sleep(seconds):
+            slept.append(seconds)
+            self.now += seconds
+            if len(slept) == 3:
+                self.numpad_led(False)      # NumLock pressed during the wait
+        self.kit.wait(2.0, sleep=sleep)
+        self.assertEqual(self.shown, [False])
+        self.assertAlmostEqual(sum(slept), 2.0)
+        self.assertLessEqual(max(slept), self.tk.INDICATOR_POLL_S + 1e-9)
+
+
+class PowerLedTests(unittest.TestCase):
+    """The blink patterns, against a fake LED directory."""
+
+    def setUp(self):
+        loader = importlib.machinery.SourceFileLoader("toolkit", str(SCRIPT))
+        self.tk = importlib.util.module_from_spec(
+            importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(self.tk)
+        self.logged = []
+        self.tk.log = self.logged.append
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.led = Path(self.tmp.name)
+        self.tk.POWER_LED = str(self.led)
+        (self.led / "trigger").write_text("none kbd-numlock [chromeos-auto] rfkill1\n")
+        (self.led / "brightness").write_text("100\n")
+        # Record every write and every pause, in order.
+        self.steps = []
+        write = self.tk.led_write
+        self.tk.led_write = lambda name, value: (self.steps.append((name, value)), write(name, value))
+        self.tk.time = type("time", (), {"sleep": lambda seconds: self.steps.append(seconds)})
+
+    def test_on_is_two_short_blinks(self):
+        self.tk.show_numlock(True)
+        self.assertEqual(self.steps, [
+            ("trigger", "none"),
+            ("brightness", "0"), 0.15, ("brightness", "100"), 0.15,
+            ("brightness", "0"), 0.15, ("brightness", "100"), 0.0,
+            ("trigger", "chromeos-auto")])
+
+    def test_off_is_one_long_blink(self):
+        self.tk.show_numlock(False)
+        self.assertEqual(self.steps, [
+            ("trigger", "none"),
+            ("brightness", "0"), 0.8, ("brightness", "100"), 0.0,
+            ("trigger", "chromeos-auto")])
+
+    def test_led_in_use_by_something_else_is_left_alone(self):
+        (self.led / "trigger").write_text("[none] kbd-numlock chromeos-auto\n")
+        self.tk.show_numlock(True)
+        self.assertEqual(self.steps, [])
+
+    def test_led_is_given_back_when_a_write_fails(self):
+        write = self.tk.led_write
+
+        def failing(name, value):
+            if name == "brightness":
+                raise PermissionError("brightness")
+            write(name, value)
+        self.tk.led_write = failing
+        self.tk.show_numlock(True)
+        self.assertEqual(len(self.logged), 1)
+        self.assertEqual(self.steps[-1], ("trigger", "chromeos-auto"))
+
+    def test_missing_led_is_reported_not_fatal(self):
+        self.tk.POWER_LED = str(self.led / "nope")
+        self.tk.show_numlock(False)
+        self.assertEqual(len(self.logged), 1)
+
 
 class ConfigTests(unittest.TestCase):
     def setUp(self):
@@ -423,6 +535,12 @@ class ConfigTests(unittest.TestCase):
     def flags(self):
         return self.tk.SYNC, self.tk.AMBIENT, self.tk.NUMLOCK
 
+    def test_indicator_is_off_unless_asked_for(self):
+        self.tk.load_config()
+        self.assertFalse(self.tk.INDICATOR)
+        self.load("indicator = yes\n")
+        self.assertTrue(self.tk.INDICATOR)
+
     def test_missing_file_keeps_defaults_silently(self):
         self.tk.load_config()
         self.assertEqual(self.flags(), (True, True, True))
@@ -432,6 +550,7 @@ class ConfigTests(unittest.TestCase):
         bands = self.tk.BANDS
         self.load((SCRIPT.parent / "packaging" / "framework-keyboard-toolkit.conf").read_text())
         self.assertEqual(self.flags(), (True, True, True))
+        self.assertFalse(self.tk.INDICATOR)
         self.assertEqual(self.tk.BANDS, bands)
         self.assertEqual(self.logged, [])
 
