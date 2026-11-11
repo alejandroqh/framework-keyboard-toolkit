@@ -1,7 +1,8 @@
 # framework-keyboard-toolkit
 
-A small service for the **Framework Laptop 16** input modules (keyboard,
-numpad, macropad) that does three things:
+A lightweight service for **Framework laptop** input modules (keyboard,
+numpad, macropad). It keeps their backlights in sync, sets the level from the
+ambient light sensor, and turns NumLock on at start:
 
 - **Backlight sync.** The keyboard and the numpad each keep their own
   backlight level, and each has its own key for it (on the numpad you even
