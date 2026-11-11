@@ -1,10 +1,14 @@
 # framework-keyboard-toolkit
 
-<img src="docs/out-of-sync.jpg" width="400" alt="Three photos of a Framework Laptop 16 keyboard and numpad: keyboard lit with the numpad dark, keyboard dark with the numpad lit, and both lit at the same level">
+<p align="center">
+  <img src="docs/out-of-sync.jpg" width="400" alt="Three photos of a Framework Laptop 16 keyboard and numpad: keyboard lit with the numpad dark, keyboard dark with the numpad lit, and both lit at the same level">
+</p>
 
-*Left and middle: the keyboard and the numpad each keep their own backlight
-level, so they end up out of sync. Right: with this service they always share
-one level.*
+<p align="center">
+  <em>Left and middle: the keyboard and the numpad each keep their own backlight
+  level, so they end up out of sync. Right: with this service they always share
+  one level.</em>
+</p>
 
 A lightweight service for **Framework laptop** input modules (keyboard,
 numpad, macropad). It keeps their backlights in sync, sets the level from the
