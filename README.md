@@ -1,5 +1,11 @@
 # framework-keyboard-toolkit
 
+![Three photos of a Framework Laptop 16 keyboard and numpad: keyboard lit with the numpad dark, keyboard dark with the numpad lit, and both lit at the same level](docs/out-of-sync.jpg)
+
+*Left and middle: the keyboard and the numpad each keep their own backlight
+level, so they end up out of sync. Right: with this service they always share
+one level.*
+
 A lightweight service for **Framework laptop** input modules (keyboard,
 numpad, macropad). It keeps their backlights in sync, sets the level from the
 ambient light sensor, and turns NumLock on at start:
