@@ -1,0 +1,519 @@
+#!/usr/bin/python3 -I
+"""Backlight sync, ambient-light backlight and NumLock for Framework Laptop 16 input modules.
+
+Runs unprivileged, in one slow polling loop:
+
+* Sync: the keyboard and numpad each keep their own backlight level. When one
+  of them changes (its own backlight key), the others are set to the same
+  level over the modules' VIA raw-HID interface.
+* Ambient light: the level follows the laptop's ambient light sensor through
+  a table of lux bands. A manual change wins until the light changes band.
+* NumLock: when the service starts or a local session appears (login screen,
+  desktop), NumLock is turned on if the numpad reports it off, by pressing
+  the NumLock key once on a throwaway virtual keyboard. After that short
+  window NumLock is left alone, so it can still be switched off by hand.
+
+Each of the three can be switched off in /etc/framework-keyboard-toolkit.conf.
+Nothing is written to the modules' EEPROM; levels set here are not saved.
+"""
+import fcntl
+import glob
+import os
+import re
+import select
+import signal
+import struct
+import sys
+import time
+
+CONFIG = "/etc/framework-keyboard-toolkit.conf"
+
+# --- Defaults; CONFIG overrides them (settings sync, ambient, numlock, bands) --
+SYNC = True                # numpad / macropad and keyboard share one level
+AMBIENT = True             # the level follows the ambient light sensor
+NUMLOCK = True             # turn NumLock on at boot / login
+
+# (below this many lux, backlight level 0-255); the last entry has no limit.
+# The white keyboards and the numpad only have four steps: 0, 85, 170, 255.
+BANDS = (
+    (8, 85),       # dark room: a low level is enough
+    (60, 170),     # dim
+    (250, 255),    # indoor light: needs full level to be visible
+    (None, 0),     # bright: off
+)
+
+# --- Tuning ------------------------------------------------------------------
+HYSTERESIS = 0.2           # lux must pass a limit by 20 % to leave a band
+DWELL = 2                  # ... on this many consecutive readings
+
+TICK_S = 2.0               # normal poll interval
+FAST_TICK_S = 0.4          # while a backlight key is being used / NumLock window
+FAST_FOR_S = 10            # how long to stay fast after a manual change
+LUX_EVERY_S = 5            # light sensor reading interval
+NUMLOCK_WINDOW_S = 30      # how long after start / new session NumLock is watched
+NUMLOCK_MAX_PRESSES = 3    # per window
+# -----------------------------------------------------------------------------
+
+VENDOR = "32AC"
+NUMPAD_PID = "0014"
+KEYBOARDS = ("0012", "0018", "0019")   # the only modules managed without sync
+# Leader first: with no light sensor, the first module's level is the one synced.
+MODULES = {
+    "0012": "keyboard (ANSI)",
+    "0018": "keyboard (ISO)",
+    "0019": "keyboard (JIS)",
+    "0014": "numpad",
+    "0013": "RGB macropad",
+}
+HIDRAW_SYS = "/sys/class/hidraw"
+DEV = "/dev"
+ALS_GLOB = "/sys/bus/iio/devices/iio:device*/in_illuminance_raw"
+LED_GLOB = "/sys/class/leds/input*::numlock"
+SESSIONS_DIR = "/run/systemd/sessions"
+UINPUT = "/dev/uinput"
+
+# VIA protocol (v3) over the raw-HID interface, usage page 0xFF60.
+VIA_USAGE = bytes([0x06, 0x60, 0xFF])
+VIA_SET, VIA_GET = 0x07, 0x08
+CHANNELS = (1, 3)          # QMK backlight (white), RGB matrix
+VAL_BRIGHTNESS = 1
+VIA_TIMEOUT_S = 0.5
+PROBE_ATTEMPTS = 5         # a new hidraw node may not be ready / chgrp'ed yet
+HID_ID = re.compile(r"^HID_ID=[0-9A-F]+:0000([0-9A-F]{4}):0000([0-9A-F]{4})$", re.M)
+
+# uinput
+UI_SET_EVBIT, UI_SET_KEYBIT = 0x40045564, 0x40045565
+UI_DEV_SETUP, UI_DEV_CREATE, UI_DEV_DESTROY = 0x405C5503, 0x5501, 0x5502
+EV_SYN, EV_KEY, KEY_NUMLOCK, BUS_VIRTUAL = 0, 1, 69, 6
+UINPUT_SETTLE_S = 1.0      # time for the compositor to pick the device up
+
+
+def log(message):
+    print(message, flush=True)
+
+
+def read_text(path):
+    with open(path) as f:
+        return f.read().strip()
+
+
+YES_NO = {"yes": True, "no": False, "true": True, "false": False,
+          "on": True, "off": False, "1": True, "0": False}
+
+
+def parse_bands(text):
+    """'8:85 60:170 *:0' -> ((8.0, 85), (60.0, 170), (None, 0)); ValueError if malformed."""
+    bands = []
+    for item in text.split():
+        limit, _, level = item.partition(":")
+        limit = None if limit == "*" else float(limit)
+        level = int(level)
+        if not 0 <= level <= 255:
+            raise ValueError(f"level {level} is not 0-255")
+        bands.append((limit, level))
+    limits = [limit for limit, _ in bands[:-1]]
+    if not bands or bands[-1][0] is not None:
+        raise ValueError("bands must end with '*:level'")
+    if None in limits or any(a >= b for a, b in zip([0.0] + limits, limits)):
+        raise ValueError("lux limits must be positive and rising")
+    return tuple(bands)
+
+
+def load_config():
+    """Apply CONFIG to the defaults; a bad line is reported and skipped."""
+    global BANDS
+    try:
+        with open(CONFIG) as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        return
+    except OSError as e:
+        log(f"{CONFIG}: {e}; using defaults")
+        return
+    for number, line in enumerate(lines, 1):
+        key, equals, value = (part.strip() for part in line.split("#", 1)[0].partition("="))
+        if not key and not equals:
+            continue
+        try:
+            if key in ("sync", "ambient", "numlock") and equals:
+                if value.lower() not in YES_NO:
+                    raise ValueError(f"'{value}' is not yes or no")
+                globals()[key.upper()] = YES_NO[value.lower()]
+            elif key == "bands" and equals:
+                BANDS = parse_bands(value)
+            else:
+                raise ValueError("unknown setting")
+        except ValueError as e:
+            log(f"{CONFIG}:{number}: ignored: {e}")
+
+
+def describe_config():
+    names = (("sync", SYNC), ("ambient light", AMBIENT), ("NumLock", NUMLOCK))
+    return ", ".join(f"{name} {'on' if value else 'off'}" for name, value in names)
+
+
+class Module:
+    """One input module, reached through its VIA raw-HID hidraw node."""
+
+    def __init__(self, name, pid, fd):
+        self.name, self.pid, self.fd = name, pid, fd
+        self.channel = None
+        self.level = None     # last level the module reported
+        self.sent = None      # last level we asked for
+
+    @property
+    def label(self):
+        return MODULES.get(self.pid, self.pid)
+
+    def xfer(self, *payload):
+        try:
+            while select.select([self.fd], [], [], 0)[0]:
+                os.read(self.fd, 64)             # drop stale reports
+            os.write(self.fd, bytes([0]) + bytes(payload).ljust(32, b"\0"))
+            if not select.select([self.fd], [], [], VIA_TIMEOUT_S)[0]:
+                return None
+            reply = os.read(self.fd, 64)
+        except OSError:
+            return None
+        return reply if len(reply) >= 4 else None
+
+    def get(self):
+        """Backlight level 0-255, or None if the module did not answer."""
+        for channel in (self.channel,) if self.channel else CHANNELS:
+            reply = self.xfer(VIA_GET, channel, VAL_BRIGHTNESS)
+            if reply and reply[:3] == bytes([VIA_GET, channel, VAL_BRIGHTNESS]):
+                self.channel = channel
+                return reply[3]
+        return None
+
+    def set(self, level):
+        reply = self.xfer(VIA_SET, self.channel, VAL_BRIGHTNESS, level)
+        return bool(reply and reply[0] == VIA_SET)
+
+    def close(self):
+        try:
+            os.close(self.fd)
+        except OSError:
+            pass
+
+
+def identify(name):
+    """USB product id if hidraw node `name` is a known module's VIA interface."""
+    try:
+        uevent = read_text(f"{HIDRAW_SYS}/{name}/device/uevent")
+        with open(f"{HIDRAW_SYS}/{name}/device/report_descriptor", "rb") as f:
+            usage = f.read(3)
+    except OSError:
+        return None
+    match = HID_ID.search(uevent)
+    if not match or match[1] != VENDOR or usage != VIA_USAGE:
+        return None
+    pid = match[2].lower()
+    return pid if pid in MODULES else None
+
+
+def open_module(name, pid):
+    """Module for hidraw node `name`, or None if it cannot be used (yet)."""
+    try:
+        fd = os.open(f"{DEV}/{name}", os.O_RDWR | os.O_NONBLOCK)
+    except OSError:
+        return None
+    module = Module(name, pid, fd)
+    module.level = module.get()
+    if module.level is None:
+        module.close()
+        return None
+    return module
+
+
+def read_lux():
+    """Ambient light in lux, or None without a (working) sensor."""
+    for raw in sorted(glob.glob(ALS_GLOB)):
+        base = raw[: -len("raw")]
+        try:
+            value = float(read_text(raw))
+        except (OSError, ValueError):
+            continue
+        scale, offset = 1.0, 0.0
+        try:
+            scale = float(read_text(base + "scale"))
+            offset = float(read_text(base + "offset"))
+        except (OSError, ValueError):
+            pass
+        return (value + offset) * scale
+    return None
+
+
+def band_of(lux):
+    for index, (limit, _) in enumerate(BANDS):
+        if limit is None or lux < limit:
+            return index
+    return len(BANDS) - 1
+
+
+def numpad_numlock():
+    """NumLock LED state of the numpad module (True / False), None without one."""
+    for led in sorted(glob.glob(LED_GLOB)):
+        try:
+            if (read_text(f"{led}/device/id/vendor").upper() == VENDOR
+                    and read_text(f"{led}/device/id/product") == NUMPAD_PID):
+                return read_text(f"{led}/brightness") != "0"
+        except OSError:
+            continue
+    return None
+
+
+def session_names():
+    """Names of the logind session files (one per session)."""
+    try:
+        return {n for n in os.listdir(SESSIONS_DIR)
+                if os.path.isfile(f"{SESSIONS_DIR}/{n}")}
+    except OSError:
+        return set()
+
+
+def has_seat(name):
+    """True for a local session (login screen, desktop, console), not ssh etc."""
+    try:
+        return bool(re.search(r"^SEAT=\S", read_text(f"{SESSIONS_DIR}/{name}"), re.M))
+    except OSError:
+        return False
+
+
+def press_numlock():
+    """Press and release NumLock on a virtual keyboard that only has that key."""
+    fd = os.open(UINPUT, os.O_WRONLY)
+    try:
+        fcntl.ioctl(fd, UI_SET_EVBIT, EV_KEY)
+        fcntl.ioctl(fd, UI_SET_KEYBIT, KEY_NUMLOCK)
+        fcntl.ioctl(fd, UI_DEV_SETUP, struct.pack(
+            "HHHH80sI", BUS_VIRTUAL, 0x32AC, 0xFFFF, 1, b"framework-keyboard-toolkit NumLock", 0))
+        fcntl.ioctl(fd, UI_DEV_CREATE)
+        try:
+            time.sleep(UINPUT_SETTLE_S)
+            for value in (1, 0):
+                os.write(fd, struct.pack("llHHi", 0, 0, EV_KEY, KEY_NUMLOCK, value))
+                os.write(fd, struct.pack("llHHi", 0, 0, EV_SYN, 0, 0))
+                time.sleep(0.03)
+            time.sleep(0.3)
+        finally:
+            fcntl.ioctl(fd, UI_DEV_DESTROY)
+    finally:
+        os.close(fd)
+
+
+class Toolkit:
+    def __init__(self, clock=time.monotonic):
+        self.clock = clock
+        self.modules = {}          # hidraw name -> Module
+        self.ignored = set()       # hidraw names that are not ours / gave up on
+        self.attempts = {}         # hidraw name -> failed probes so far
+        self.target = None         # level every module should have
+        self.band = None           # current ambient band (index into BANDS)
+        self.candidate = (None, 0)  # band waiting to be confirmed, readings so far
+        self.held = False          # manual level kept until the band changes
+        self.next_lux = 0.0
+        self.fast_until = 0.0
+        self.sessions = None
+        self.numlock_until = 0.0
+        self.numlock_presses = 0
+        self.numlock_off_seen = False
+
+    # -- modules ---------------------------------------------------------------
+
+    def ordered(self):
+        order = list(MODULES)
+        return sorted(self.modules.values(), key=lambda m: (order.index(m.pid), m.name))
+
+    def drop(self, name, why):
+        module = self.modules.pop(name)
+        module.close()
+        log(f"{module.label} ({name}) {why}")
+
+    def refresh_modules(self):
+        try:
+            names = set(os.listdir(HIDRAW_SYS))
+        except OSError:
+            names = set()
+        for name in set(self.modules) - names:
+            self.drop(name, "removed")
+        self.ignored &= names
+        self.attempts = {n: c for n, c in self.attempts.items() if n in names}
+        for name in sorted(names - set(self.modules) - self.ignored):
+            pid = identify(name)
+            if not SYNC and pid not in KEYBOARDS:
+                pid = None                       # numpad / macropad keep their own level
+            module = open_module(name, pid) if pid else None
+            if module:
+                self.modules[name] = module
+                self.attempts.pop(name, None)
+                log(f"{module.label} ({name}) found, backlight {module.level}")
+            elif pid and self.attempts.get(name, 0) + 1 < PROBE_ATTEMPTS:
+                self.attempts[name] = self.attempts.get(name, 0) + 1
+            else:
+                if pid:
+                    log(f"{MODULES[pid]} ({name}) cannot be opened or does not answer")
+                self.ignored.add(name)
+
+    def read_levels(self):
+        """Refresh every module's level; return a level changed by hand, if any."""
+        manual = None
+        for module in self.ordered():
+            level = module.get()
+            if level is None:
+                self.drop(module.name, "stopped answering")
+                continue
+            if level != module.level and manual is None:
+                manual = level
+                log(f"{module.label} backlight changed by hand to {level}")
+            module.level = level
+        return manual
+
+    def apply(self):
+        if self.target is None:
+            return
+        for module in self.ordered():
+            if module.level == self.target:
+                module.sent = self.target
+            elif module.sent != self.target:
+                # Asked once per target: a module may round to its own steps.
+                module.sent = self.target
+                if module.set(self.target):
+                    level = module.get()
+                    if level is not None:
+                        module.level = level
+
+    # -- ambient light -----------------------------------------------------------
+
+    def update_band(self, lux):
+        """Feed one reading; True when the confirmed band changed."""
+        raw = band_of(lux)
+        if self.band is None:
+            self.band = raw
+            return True
+        low = BANDS[self.band - 1][0] if self.band else 0
+        high = BANDS[self.band][0]
+        inside = lux >= low * (1 - HYSTERESIS) and (high is None or lux < high * (1 + HYSTERESIS))
+        if inside or raw == self.band:
+            self.candidate = (None, 0)
+            return False
+        band, count = self.candidate
+        count = count + 1 if band == raw else 1
+        if count < DWELL:
+            self.candidate = (raw, count)
+            return False
+        self.band, self.candidate = raw, (None, 0)
+        return True
+
+    def follow_light(self):
+        lux = read_lux()
+        if lux is None:
+            return
+        if self.update_band(lux):
+            self.held = False
+            log(f"ambient light {lux:.0f} lux: backlight {BANDS[self.band][1]}")
+        if not self.held:
+            self.target = BANDS[self.band][1]
+
+    # -- NumLock -----------------------------------------------------------------
+
+    def numlock(self, now):
+        current = session_names()
+        if self.sessions is None or any(has_seat(n) for n in current - self.sessions):
+            self.numlock_until = now + NUMLOCK_WINDOW_S
+            self.numlock_presses = 0
+            self.numlock_off_seen = False
+        self.sessions = current
+        if now >= self.numlock_until:
+            return
+        if numpad_numlock() is not False:        # on, or no numpad attached
+            self.numlock_off_seen = False
+        elif not self.numlock_off_seen:
+            # Off on one reading may be a compositor still starting: look again.
+            self.numlock_off_seen = True
+        elif self.numlock_presses < NUMLOCK_MAX_PRESSES:
+            self.numlock_presses += 1
+            self.numlock_off_seen = False
+            log("NumLock is off, turning it on")
+            try:
+                press_numlock()
+            except OSError as e:
+                log(f"NumLock key press failed: {e}")
+
+    # -- loop --------------------------------------------------------------------
+
+    def tick(self):
+        """One pass; returns the seconds to sleep before the next."""
+        now = self.clock()
+        manual = None
+        if SYNC or AMBIENT:
+            self.refresh_modules()
+            manual = self.read_levels()
+        if manual is not None:
+            self.target = manual
+            self.held = True
+            self.fast_until = now + FAST_FOR_S
+        if AMBIENT and self.modules and now >= self.next_lux:
+            self.next_lux = now + LUX_EVERY_S
+            self.follow_light()
+        if self.target is None and self.modules:
+            self.target = self.ordered()[0].level
+        self.apply()
+        if NUMLOCK:
+            self.numlock(now)
+        fast = now < self.fast_until or now < self.numlock_until
+        return FAST_TICK_S if fast else TICK_S
+
+    def close(self):
+        for name in list(self.modules):
+            self.modules.pop(name).close()
+
+
+def status():
+    """Print what the service would see; changes nothing."""
+    global log
+    load_config()
+    print(f"config:    {describe_config()}")
+    log = lambda message: None
+    kit = Toolkit()
+    kit.refresh_modules()
+    if not kit.modules:
+        print("modules:   none managed (not attached, switched off in the config, or no access)")
+    for module in kit.ordered():
+        print(f"module:    {module.label} ({module.name}), backlight {module.level}/255")
+    kit.close()
+    lux = read_lux()
+    if lux is None:
+        print("light:     no ambient light sensor found")
+    else:
+        print(f"light:     {lux:.0f} lux -> backlight {BANDS[band_of(lux)][1]}/255"
+              + ("" if AMBIENT else " (not used: ambient light is off)"))
+    state = numpad_numlock()
+    print("numlock:   " + {True: "on", False: "off", None: "no numpad attached"}[state])
+    print(f"uinput:    {'writable' if os.access(UINPUT, os.W_OK) else 'not writable'}")
+    print(f"sessions:  {sorted(n for n in session_names() if has_seat(n)) or 'none'} (local)")
+
+
+def shutdown(*_):
+    sys.exit(0)
+
+
+def main():
+    if sys.argv[1:] == ["--status"]:
+        return status()
+    if sys.argv[1:]:
+        sys.exit("usage: framework-keyboard-toolkit [--status]")
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+    load_config()
+    log(describe_config())
+    kit = Toolkit()
+    try:
+        while True:
+            time.sleep(kit.tick())
+    finally:
+        kit.close()
+
+
+if __name__ == "__main__":
+    main()

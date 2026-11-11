@@ -1,0 +1,7 @@
+# Let group fw-kbd-toolkit use the VIA raw-HID interface (USB interface 01) of
+# the Framework Laptop 16 input modules, so framework-keyboard-toolkit can run
+# without root: keyboards 0012 / 0018 / 0019, RGB macropad 0013, numpad 0014.
+# Only that interface: the ones that carry key presses stay private.
+ACTION!="remove", SUBSYSTEM=="hidraw", ENV{ID_VENDOR_ID}=="32ac", \
+  ENV{ID_MODEL_ID}=="0012|0013|0014|0018|0019", ENV{ID_USB_INTERFACE_NUM}=="01", \
+  GROUP="fw-kbd-toolkit", MODE="0660"

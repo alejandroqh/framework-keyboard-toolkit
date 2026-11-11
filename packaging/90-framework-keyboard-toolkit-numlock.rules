@@ -1,0 +1,5 @@
+# Let group fw-kbd-toolkit use /dev/uinput, so framework-keyboard-toolkit can
+# press NumLock on a virtual keyboard at boot / login. Installed only while
+# "numlock = yes" is set in /etc/framework-keyboard-toolkit.conf.
+ACTION!="remove", SUBSYSTEM=="misc", KERNEL=="uinput", \
+  GROUP="fw-kbd-toolkit", MODE="0660", OPTIONS+="static_node=uinput"

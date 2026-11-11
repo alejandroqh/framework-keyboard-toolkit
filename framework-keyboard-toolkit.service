@@ -1,0 +1,50 @@
+[Unit]
+Description=Framework Laptop 16 keyboard toolkit (backlight sync, ambient light, NumLock)
+After=systemd-udevd.service systemd-logind.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/framework-keyboard-toolkit
+Restart=on-failure
+RestartSec=2
+
+# Unprivileged: a throwaway user that may only open the input modules' VIA
+# interface and /dev/uinput (udev rule grants group fw-kbd-toolkit access).
+DynamicUser=yes
+SupplementaryGroups=fw-kbd-toolkit
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+
+# Devices: nothing but hidraw nodes and uinput
+DevicePolicy=closed
+DeviceAllow=char-hidraw rw
+DeviceAllow=/dev/uinput rw
+
+# Sandbox
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+RestrictAddressFamilies=none
+IPAddressDeny=any
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
