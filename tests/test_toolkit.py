@@ -71,7 +71,8 @@ class ToolkitTests(unittest.TestCase):
         self.tk.show_numlock = self.shown.append
 
         self.now = 100.0
-        self.kit = self.tk.Toolkit(clock=lambda: self.now)
+        self.asleep = 0.0          # seconds spent suspended (boottime runs, monotonic stops)
+        self.kit = self.tk.Toolkit(clock=lambda: self.now, boottime=lambda: self.now + self.asleep)
 
     # -- helpers -----------------------------------------------------------------
 
@@ -312,6 +313,24 @@ class ToolkitTests(unittest.TestCase):
         self.light(30)                      # evening
         self.ticks(self.tk.LUX_EVERY_S * 3)
         self.assertEqual((kbd.actual, pad.actual), (170, 170))
+
+    def test_levels_restored_after_sleep_are_not_a_manual_change(self):
+        self.light(5)
+        kbd, pad = self.keyboard_and_numpad(kbd=255, pad=0)
+        self.ticks(10)
+        self.assertEqual((kbd.actual, pad.actual), (255, 255))
+        self.asleep += 3600
+        pad.actual = 0                      # numpad wakes at its saved level
+        self.tick()
+        self.assertEqual((kbd.actual, pad.actual), (255, 255))
+        self.ticks(5)
+        kbd.actual = 0                      # the module resets again a moment later
+        self.tick()
+        self.assertEqual((kbd.actual, pad.actual), (255, 255))
+        self.ticks(10)
+        kbd.actual = 85                     # a real key press, once settled, still wins
+        self.tick()
+        self.assertEqual(pad.actual, 85)
 
     def test_without_sensor_it_only_syncs(self):
         kbd, pad = self.keyboard_and_numpad(kbd=170, pad=0)

@@ -2,6 +2,8 @@
 # fkt: install, configure and inspect framework-keyboard-toolkit.
 set -euo pipefail
 
+# Not a setting: the same name is in this repo's file names, the unit's
+# ExecStart and the watcher's config path, so changing it breaks everything.
 NAME=framework-keyboard-toolkit
 BIN=/usr/local/sbin/$NAME
 UNIT=/etc/systemd/system/$NAME.service

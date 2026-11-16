@@ -8,6 +8,7 @@ Runs unprivileged, in one slow polling loop:
   level over the modules' VIA raw-HID interface.
 * Ambient light: the level follows the laptop's ambient light sensor through
   a table of lux bands. A manual change wins until the light changes band.
+  After sleep the modules come back at their saved level; it is set again.
 * NumLock: when the service starts or a local session appears (login screen,
   desktop), NumLock is turned on if the numpad reports it off, by pressing
   the NumLock key once on a throwaway virtual keyboard. After that short
@@ -51,6 +52,7 @@ DWELL = 2                  # ... on this many consecutive readings
 TICK_S = 2.0               # normal poll interval
 FAST_TICK_S = 0.4          # while a backlight key is being used / NumLock window
 FAST_FOR_S = 10            # how long to stay fast after a manual change
+RESUME_S = 10              # after sleep, level changes are modules restoring their saved one
 LUX_EVERY_S = 5            # light sensor reading interval
 NUMLOCK_WINDOW_S = 30      # how long after start / new session NumLock is watched
 NUMLOCK_MAX_PRESSES = 3    # per window
@@ -346,8 +348,11 @@ def press_numlock():
 
 
 class Toolkit:
-    def __init__(self, clock=time.monotonic):
-        self.clock = clock
+    def __init__(self, clock=time.monotonic,
+                 boottime=lambda: time.clock_gettime(time.CLOCK_BOOTTIME)):
+        self.clock, self.boottime = clock, boottime
+        self.slept = None          # boottime - clock: grows only while suspended
+        self.resume_until = 0.0
         self.modules = {}          # hidraw name -> Module
         self.ignored = set()       # hidraw names that are not ours / gave up on
         self.attempts = {}         # hidraw name -> failed probes so far
@@ -399,7 +404,7 @@ class Toolkit:
                     log(f"{MODULES[pid]} ({name}) cannot be opened or does not answer")
                 self.ignored.add(name)
 
-    def read_levels(self):
+    def read_levels(self, resuming=False):
         """Refresh every module's level; return a level changed by hand, if any."""
         manual = None
         for module in self.ordered():
@@ -407,7 +412,9 @@ class Toolkit:
             if level is None:
                 self.drop(module.name, "stopped answering")
                 continue
-            if level != module.level and manual is None:
+            if level != module.level and resuming:
+                module.sent = None               # back from sleep at its saved level: set it again
+            elif level != module.level and manual is None:
                 manual = level
                 log(f"{module.label} backlight changed by hand to {level}")
             module.level = level
@@ -496,10 +503,15 @@ class Toolkit:
     def tick(self):
         """One pass; returns the seconds to sleep before the next."""
         now = self.clock()
+        slept = self.boottime() - now
+        if self.slept is not None and slept - self.slept > 1:
+            self.resume_until = now + RESUME_S
+            log("back from sleep")
+        self.slept = slept
         manual = None
         if SYNC or AMBIENT:
             self.refresh_modules()
-            manual = self.read_levels()
+            manual = self.read_levels(resuming=now < self.resume_until)
         if manual is not None:
             self.target = manual
             self.held = True
@@ -512,7 +524,7 @@ class Toolkit:
         self.apply()
         if NUMLOCK:
             self.numlock(now)
-        fast = now < self.fast_until or now < self.numlock_until
+        fast = now < self.fast_until or now < self.numlock_until or now < self.resume_until
         return FAST_TICK_S if fast else TICK_S
 
     def wait(self, seconds, sleep=time.sleep):
