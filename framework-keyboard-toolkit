@@ -8,7 +8,9 @@ Runs unprivileged, in one slow polling loop:
   level over the modules' VIA raw-HID interface.
 * Ambient light: the level follows the laptop's ambient light sensor through
   a table of lux bands. A manual change wins until the light changes band.
-  After sleep the modules come back at their saved level; it is set again.
+  After sleep the modules come back at their saved level; it is set again,
+  and the sensor decides the level (closing the lid blanks the modules,
+  which reads like a manual change to 0).
 * NumLock: when the service starts or a local session appears (login screen,
   desktop), NumLock is turned on if the numpad reports it off, by pressing
   the NumLock key once on a throwaway virtual keyboard. After that short
@@ -506,6 +508,7 @@ class Toolkit:
         slept = self.boottime() - now
         if self.slept is not None and slept - self.slept > 1:
             self.resume_until = now + RESUME_S
+            self.held, self.next_lux = False, now   # drop the lid-close "manual" 0, read the light now
             log("back from sleep")
         self.slept = slept
         manual = None

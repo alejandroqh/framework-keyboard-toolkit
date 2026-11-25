@@ -332,6 +332,18 @@ class ToolkitTests(unittest.TestCase):
         self.tick()
         self.assertEqual(pad.actual, 85)
 
+    def test_lid_close_before_sleep_does_not_keep_the_backlight_off(self):
+        self.light(5)
+        kbd, pad = self.keyboard_and_numpad()
+        self.ticks(10)
+        kbd.actual = pad.actual = 0         # closing the lid blanks the modules
+        self.tick()
+        self.asleep += 7200                 # room still dark when the lid opens
+        kbd.actual = pad.actual = 255       # modules wake at their saved level
+        self.tick()
+        self.assertEqual((kbd.actual, pad.actual), (255, 255))
+        self.assertEqual(kbd.sets + pad.sets, [])    # nothing sent, so no flash to 0 on wake
+
     def test_without_sensor_it_only_syncs(self):
         kbd, pad = self.keyboard_and_numpad(kbd=170, pad=0)
         self.ticks(30)

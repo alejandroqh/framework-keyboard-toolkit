@@ -44,7 +44,8 @@ One unprivileged, sandboxed process polls every 2 seconds:
   by 20 % and show up on two readings in a row, so a passing shadow or light
   hovering at a limit does not make the keys flicker.
 - A level chosen by hand wins over the sensor until the light moves to
-  another band of the table; then the sensor takes over again.
+  another band of the table, or the laptop wakes from sleep; then the sensor
+  takes over again.
 - When the service starts, and whenever a local session appears (login
   screen, desktop), it watches the numpad's NumLock LED for 30 seconds. If
   the LED is off, it presses NumLock once on a throwaway virtual keyboard
